@@ -99,10 +99,13 @@ class AudioProcessor:
     def resample_audio(self, audio_data, orig_sr, target_sr):
         """Resample audio data to target sample rate while preserving signal characteristics"""
         if orig_sr == target_sr:
-            return audio_data
+            return audio_data.astype(np.float32)
             
         # Calculate resampling ratio
         ratio = target_sr / orig_sr
+        
+        # Ensure input is float32
+        audio_data = audio_data.astype(np.float32)
         
         # Normalize the signal to [-1, 1] range before resampling
         if np.max(np.abs(audio_data)) > 0:
@@ -124,7 +127,7 @@ class AudioProcessor:
         if np.max(np.abs(resampled)) > 0:
             resampled = resampled / np.max(np.abs(resampled))
         
-        return resampled
+        return resampled.astype(np.float32)
 
     def process_audio_chunk(self, chunk):
         """Process a chunk of audio data"""
@@ -268,6 +271,13 @@ class AudioProcessor:
     def _process_recording(self, audio_array):
         """Process a single recording"""
         try:
+            # Ensure audio is float32 and normalized for Whisper
+            audio_array = np.array(audio_array, dtype=np.float32)
+            
+            # Normalize if not already in [-1, 1]
+            if np.max(np.abs(audio_array)) > 1.0:
+                audio_array = audio_array / np.max(np.abs(audio_array))
+            
             # Transcribe with Whisper
             logger.info("Transcribing audio...")
             result = self.model.transcribe(audio_array)

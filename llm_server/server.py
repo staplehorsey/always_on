@@ -50,7 +50,7 @@ app.add_middleware(
 
 # Initialize LLM Engine
 engine_args = AsyncEngineArgs(
-    model="TheBloke/Mistral-7B-Instruct-v0.2-GPTQ",  # Pre-quantized model
+    model="TheBloke/Mistral-7B-v0.1-GGUF",  # Switch to GGUF model
     download_dir=models_dir,  # Use absolute path to models directory
     gpu_memory_utilization=0.7,  # Reduced to avoid OOM
     tensor_parallel_size=1,
@@ -60,7 +60,7 @@ engine_args = AsyncEngineArgs(
     enforce_eager=True,
     max_num_batched_tokens=4096,  # Limit batch size
     max_num_seqs=1,  # Process one sequence at a time
-    quantization="gptq"  # Use GPTQ quantization
+    quantization=None  # Remove GPTQ quantization
 )
 engine = None
 

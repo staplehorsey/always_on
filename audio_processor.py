@@ -64,7 +64,7 @@ def load_config():
 def setup_logging(config):
     """Setup logging configuration"""
     log_dir = config.get('LOG_DIR')
-    log_level = getattr(logging, config.get('LOG_LEVEL', 'INFO'))
+    log_level = getattr(logging, config.get('LOG_LEVEL', 'DEBUG'))
     
     # Create log directory if it doesn't exist
     try:
@@ -109,7 +109,7 @@ def main():
         processor = AudioOrchestrator(
             server_host=config.get('SERVER_HOST', 'staple.local'),
             server_port=int(config.get('SERVER_PORT', '12345')),
-            enable_monitoring=config.get('ENABLE_MONITORING', 'false').lower() == 'true',
+            enable_monitoring=config.get('ENABLE_MONITORING', 'true').lower() == 'true',
             recordings_dir=config.get('RECORDINGS_DIR')
         )
         

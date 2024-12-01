@@ -2,6 +2,7 @@ import logging
 import queue
 import threading
 from typing import Optional
+import numpy as np
 
 from .io_handler import AudioIOHandler
 from .vad import VoiceActivityDetector
@@ -14,9 +15,10 @@ logger = logging.getLogger('audio-processor.orchestrator')
 
 class AudioOrchestrator:
     def __init__(self, server_host: str = 'staple.local', server_port: int = 12345,
-                 enable_monitoring: bool = True, recordings_dir: str = 'recordings'):
+                 enable_monitoring: bool = True, recordings_dir: str = 'recordings',
+                 server_sample_rate: int = 44100):
         # Initialize components
-        self.io_handler = AudioIOHandler(server_host, server_port, enable_monitoring)
+        self.io_handler = AudioIOHandler(server_host, server_port, enable_monitoring, server_sample_rate)
         self.vad = VoiceActivityDetector()
         self.processor = AudioProcessor()
         self.transcriber = AudioTranscriber()
@@ -49,7 +51,7 @@ class AudioOrchestrator:
                 # Mark task as done
                 self.processing_queue.task_done()
             except Exception as e:
-                logger.error(f"Error in queue processor: {e}")
+                logger.error(f"Error in queue processor: {e}", exc_info=True)
                 continue
     
     def _add_to_queue(self, audio_array) -> None:
@@ -64,21 +66,47 @@ class AudioOrchestrator:
         except Exception as e:
             logger.error(f"Error adding to queue: {e}")
     
-    def _process_recording(self, audio_array) -> None:
+    def _process_recording(self, audio_array: np.ndarray) -> None:
         """Process a single recording"""
         try:
-            # Normalize audio for processing
-            audio_array = self.processor.normalize_audio(audio_array)
+            # Debug info about input
+            logger.debug(f"Processing recording: type={type(audio_array)}, shape={audio_array.shape}, dtype={audio_array.dtype}")
             
-            # Transcribe audio
+            # Convert to float32 if needed
+            audio_array = np.array(audio_array, dtype=np.float32)
+            logger.debug(f"After float32 conversion: shape={audio_array.shape}, dtype={audio_array.dtype}")
+            
+            # Skip empty recordings
+            if len(audio_array) == 0:
+                logger.warning("Empty recording - skipping processing")
+                return
+                
+            if not np.any(audio_array):
+                logger.warning("Silent recording (all zeros) - skipping processing")
+                return
+            
+            # Debug array stats
+            logger.debug(f"Array stats: min={np.min(audio_array)}, max={np.max(audio_array)}, mean={np.mean(audio_array)}")
+            
+            # Audio is already at target rate from VAD, no need to resample
+            
+            # Normalize once for Whisper
+            if np.max(np.abs(audio_array)) > 0:
+                audio_array = audio_array / np.max(np.abs(audio_array))
+                logger.debug(f"After normalization: min={np.min(audio_array)}, max={np.max(audio_array)}")
+            
+            # Transcribe with Whisper
+            logger.info("Transcribing audio...")
             result = self.transcriber.transcribe(audio_array)
+            
             if not result:
                 logger.warning("No transcript generated - skipping processing")
                 return
             
             transcript = result["text"].strip()
+            logger.debug(f"Generated transcript: {transcript[:100]}...")
             
-            # Generate title and summary
+            # Generate title and summary using LLM
             title, summary = self.llm_processor.generate_title_and_summary(transcript)
             
             # Save recording and metadata
@@ -88,41 +116,31 @@ class AudioOrchestrator:
             )
             
         except Exception as e:
-            logger.error(f"Error processing recording: {e}")
+            logger.error(f"Error processing audio chunk: {e}", exc_info=True)
     
     def process_audio_chunk(self, chunk) -> None:
         """Process a chunk of audio data"""
         try:
-            # Convert to float32 and play if monitoring enabled
+            # Convert bytes to float32
+            samples = np.frombuffer(chunk, dtype=np.float32)
+            
+            # Play audio if monitoring enabled
             self.io_handler.play_audio(chunk)
             
-            # Resample audio for processing
-            resampled = self.processor.resample_audio(
-                chunk, self.io_handler.server_sample_rate
-            )
-            
-            # Update monitoring buffer
+            # Update monitoring buffer with resampled audio
+            resampled = self.processor.resample_audio(samples, self.io_handler.server_sample_rate)
             self.processor.update_monitoring_buffer(resampled)
             
-            # Process audio frame for VAD
-            vad_result = self.vad.process_frame(resampled)
-            if vad_result:
-                is_speech, audio_frame = vad_result
-                
-                # Get context buffer for padding
-                context_buffer = self.processor.get_context_buffer()
-                
-                # Update recording state
-                recording = self.vad.update_recording_state(
-                    is_speech, audio_frame, context_buffer
-                )
-                
-                # If recording complete, add to processing queue
-                if recording is not None:
-                    self._add_to_queue(recording)
+            # Process audio frame for VAD with context buffer
+            recording = self.vad.process_frame(resampled, self.processor.monitoring_buffer)
+            
+            # Add to queue if we got a valid recording (non-empty array)
+            if recording is not None and len(recording) > 0:
+                logger.debug(f"Got recording: shape={recording.shape}, non-zero={np.any(recording)}")
+                self._add_to_queue(recording)
             
         except Exception as e:
-            logger.error(f"Error processing audio chunk: {e}")
+            logger.error(f"Error processing audio chunk: {e}", exc_info=True)
     
     def run(self) -> None:
         """Main processing loop"""

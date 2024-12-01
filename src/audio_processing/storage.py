@@ -16,6 +16,13 @@ class StorageManager:
                       title: str, summary: str, sample_rate: int) -> Optional[str]:
         """Save recording and metadata to disk"""
         try:
+            # Ensure audio data is contiguous and float32
+            audio_data = np.ascontiguousarray(audio_data, dtype=np.float32)
+            
+            # Normalize if needed
+            if np.max(np.abs(audio_data)) > 0:
+                audio_data = audio_data / np.max(np.abs(audio_data))
+            
             # Get current timestamp
             now = datetime.now()
             year = now.strftime("%Y")
@@ -34,7 +41,7 @@ class StorageManager:
             # Save files
             logger.info(f"Saving recording to {dir_name}...")
             
-            # Save audio
+            # Save audio (ensure it's normalized and contiguous)
             wavfile.write(f"{dir_name}/audio.wav", sample_rate, audio_data)
             
             # Save transcript

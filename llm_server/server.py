@@ -94,7 +94,7 @@ async def startup_event():
             model_path=model_path,
             n_ctx=512,  # Reduced from 2048
             n_batch=32,  # Reduced from 256
-            n_gpu_layers=1,  # Start with minimal GPU usage
+            n_gpu_layers=0,  # Start with minimal GPU usage
             verbose=True,
             seed=42,
             f16_kv=True,  # Use float16 for key/value cache

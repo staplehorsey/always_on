@@ -56,8 +56,7 @@ engine_args = AsyncEngineArgs(
     enforce_eager=True,
     max_num_batched_tokens=4096,  # Limit batch size
     max_num_seqs=1,  # Process one sequence at a time
-    quantization="awq",  # Enable quantization
-    gpu_memory_utilization_ratio=0.7  # Explicit memory ratio
+    quantization="awq"  # Enable quantization
 )
 engine = None
 
@@ -91,6 +90,31 @@ async def startup_event():
     global engine
     logger.info("Starting LLM server...")
     try:
+        # Load AWQ model if available
+        model_path = os.path.join(engine_args.download_dir, "mistral-awq")
+        if not os.path.exists(model_path):
+            logger.info("AWQ model not found, downloading and converting...")
+            from awq import AutoAWQForCausalLM
+            from transformers import AutoTokenizer
+            
+            # Download and convert model
+            model_name = "mistralai/Mistral-7B-Instruct-v0.3"
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoAWQForCausalLM.from_pretrained(
+                model_name,
+                device_map="cuda:0",
+                trust_remote_code=True
+            )
+            
+            # Quantize and save
+            model.quantize(tokenizer)
+            model.save_quantized(model_path)
+            logger.info(f"AWQ model saved to {model_path}")
+            
+            # Update engine args to use quantized model
+            engine_args.model = model_path
+        
+        # Initialize engine
         engine = AsyncLLMEngine.from_engine_args(engine_args)
         logger.info("LLM engine initialized successfully")
     except Exception as e:

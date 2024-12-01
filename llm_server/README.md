@@ -36,10 +36,8 @@ engine_args = AsyncEngineArgs(
     enforce_eager=True,             # More stable on older GPUs
     max_num_batched_tokens=4096,    # Limit batch size
     max_num_seqs=1,                 # Process one sequence at a time
-    quantization="awq",            # Enable quantization
-    gpu_memory_utilization_ratio=0.7  # Explicit memory ratio
+    quantization="awq"             # Enable quantization
 )
-```
 
 ### Memory Management Tips
 - If you're still experiencing OOM errors:

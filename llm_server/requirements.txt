@@ -1,8 +1,11 @@
 --extra-index-url https://download.pytorch.org/whl/cu118
 torch==2.1.2+cu118
 transformers==4.36.2
-vllm==0.6.4.post1
-fastapi==0.115.5
-uvicorn==0.32.1
-pydantic==2.10.2
+fastapi==0.104.1
+uvicorn==0.24.0
+pydantic==2.5.1
+llama-cpp-python==0.2.20
+python-multipart==0.0.6
+requests==2.31.0
+tqdm==4.66.1
 ninja==1.11.1.2

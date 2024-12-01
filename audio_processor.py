@@ -1,4 +1,5 @@
 import os
+import json
 import numpy as np
 import sounddevice as sd
 import whisper
@@ -6,12 +7,13 @@ import torch
 import time
 import queue
 import threading
-import json
 import re
 import openai
 import logging
 import logging.handlers
 from datetime import datetime
+import aiohttp
+from scipy.io import wavfile
 
 # Set up logging
 os.makedirs('logs', exist_ok=True)
@@ -45,16 +47,19 @@ class AudioProcessor:
         self.summarization_queue = queue.Queue()
         self.max_queue_size = 10  # Maximum number of pending recordings
         
+        # Initialize model ready event
+        self.model_ready = threading.Event()
+        
         # Initialize OpenAI client for local server
         openai.api_key = "dummy"  # Not used but required
-        openai.api_base = "http://localhost:8000/v1"
+        openai.api_base = "http://rat.local:8080/v1"
         self.openai_client = openai.Client(
             api_key="dummy",
-            base_url="http://localhost:8000/v1"
+            base_url="http://rat.local:8080/v1"
         )
         
         # Initialize models in separate threads
-        self.model_ready = threading.Event()
+        
         self.shutdown_flag = threading.Event()
         
         # Start model initialization thread
@@ -144,6 +149,33 @@ class AudioProcessor:
                 logger.error(f"Error processing recording: {str(e)}")
                 continue
     
+    async def generate_summary(self, transcript: str) -> str:
+        """Generate a summary of the transcript using the LLM API."""
+        try:
+            prompt = f"[INST] Please summarize this conversation or audio transcript. Focus on the key points and main ideas:\n\n{transcript}\n\nProvide a concise summary that captures the essential information. [/INST]"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post("http://rat.local:8080/completion", 
+                    json={
+                        "prompt": prompt,
+                        "temperature": 0.7,
+                        "top_k": 40,
+                        "top_p": 0.95,
+                        "n_predict": 256,
+                        "stop": ["[INST]", "</s>"],
+                        "stream": False
+                    }
+                ) as response:
+                    if response.status != 200:
+                        raise Exception(f"LLM API error: {response.status}")
+                    
+                    result = await response.json()
+                    return result["content"].strip()
+                    
+        except Exception as e:
+            logger.error(f"Failed to generate summary: {e}")
+            return f"Error generating summary: {str(e)}"
+
     def audio_callback(self, indata, frames, time_info, status):
         if status:
             logger.warning(f"Status: {status}")
@@ -221,7 +253,7 @@ class AudioProcessor:
             
             # Generate title and summary using Mistral
             logger.info("\nGenerating title and summary...")
-            logger.info(f"Transcript length: {len(transcript)} chars")
+            logger.info("Transcript length: %d chars", len(transcript))
             
             # Truncate transcript if too long (Mistral has a 2048 token limit)
             max_transcript_chars = 1000  # Conservative limit to leave room for prompt
@@ -243,73 +275,40 @@ Output format:
 
 Remember to output ONLY valid JSON. [/INST]'''
 
-            logger.info("\nPrompt length:", len(prompt))
+            logger.info("\nPrompt length: %d", len(prompt))
             
-            # Try multiple times with different temperatures
-            attempts = 0
-            max_attempts = 3
+            # Try different temperatures if generation fails
             temperatures = [0.7, 0.9, 0.5]
+            success = False
             
-            while attempts < max_attempts:
+            for i, temp in enumerate(temperatures, 1):
                 try:
-                    logger.info(f"\nAttempt {attempts + 1} with temperature {temperatures[attempts]}")
-                    start_time = time.time()
-                    
+                    logger.info("\nAttempt %d with temperature %s", i, temp)
                     response = self.openai_client.chat.completions.create(
                         model="mistral",
                         messages=[{"role": "user", "content": prompt}],
-                        max_tokens=200,
-                        temperature=temperatures[attempts],
-                        top_p=0.9,
-                        num_return_sequences=1,
-                        return_full_text=False
-                    )['choices'][0]['message']['content'].strip()
+                        temperature=temp,
+                        max_tokens=200
+                    )
                     
-                    generation_time = time.time() - start_time
-                    logger.info(f"Generation took {generation_time:.2f} seconds")
-                    logger.info(f"Raw response ({len(response)} chars):\n{response[:500]}...")
-                    
-                    # Find JSON content
-                    json_match = re.search(r'\{[^{]*\}', response)
-                    if json_match:
-                        json_str = json_match.group()
-                        logger.info(f"\nExtracted JSON:\n{json_str}")
-                        
-                        result_dict = json.loads(json_str)
-                        title = result_dict.get('title', '').strip()
-                        summary = result_dict.get('summary', '').strip()
-                        
-                        logger.info(f"\nTitle: {title}")
-                        logger.info(f"Summary: {summary}")
-                        
-                        # Validate title
-                        title_words = [w for w in title.split() if w.strip()]
-                        if len(title_words) >= 2 and len(title_words) <= 5 and not any(title.lower().startswith(w) for w in ["okay", "um", "uh", "so"]):
-                            # Validate summary
-                            summary_sentences = [s.strip() for s in summary.split('.') if s.strip()]
-                            if len(summary_sentences) >= 2 and len(summary_sentences) <= 3:
-                                logger.info("\nValidation passed!")
-                                break
-                        
-                        logger.info("Failed validation:")
-                        logger.info(f"Title words: {len(title_words)}")
-                        logger.info(f"Summary sentences: {len(summary_sentences)}")
-                    else:
-                        logger.info("No JSON found in response")
-                    
-                    logger.info(f"\nAttempt {attempts + 1} failed validation, trying again...")
-                    attempts += 1
-                except json.JSONDecodeError as e:
-                    logger.error(f"\nJSON parsing error in attempt {attempts + 1}: {str(e)}")
-                    attempts += 1
+                    if response and response.choices:
+                        try:
+                            # Parse the JSON response
+                            response_json = json.loads(response.choices[0].message.content.strip())
+                            title = response_json.get("title", "Untitled Recording")
+                            summary = response_json.get("summary", "No summary available.")
+                            success = True
+                            break
+                        except json.JSONDecodeError as e:
+                            logger.error("\nError parsing JSON response: %s", str(e))
+                            continue
                 except Exception as e:
-                    logger.error(f"\nError in attempt {attempts + 1}: {str(e)}")
-                    logger.error(f"Error type: {type(e)}")
-                    import traceback
+                    logger.error("\nError in attempt %d: %s", i, str(e))
+                    logger.error("Error type: %s", type(e))
                     logger.error("Traceback:", exc_info=True)
-                    attempts += 1
+                    continue
             
-            if attempts == max_attempts:
+            if not success:
                 logger.info("All attempts failed, using fallback")
                 # Extract meaningful words for title
                 words = transcript.split()

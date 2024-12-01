@@ -3,6 +3,7 @@ fastapi>=0.115.5
 uvicorn>=0.32.1
 pydantic>=2.10.2
 ninja>=1.11.1.2
+auto-gptq>=0.6.0
 transformers>=4.36.2
 torch>=2.1.2
 accelerate>=0.26.1

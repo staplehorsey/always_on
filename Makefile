@@ -12,7 +12,7 @@ setup: setup-server setup-client
 
 setup-server:
 	python3 -m venv $(SERVER_DIR)/$(VENV_DIR)
-	cd $(SERVER_DIR) && ../$(VENV_DIR)/bin/pip install -r requirements.txt
+	cd $(SERVER_DIR) && ./$(VENV_DIR)/bin/pip install -r requirements.txt
 	mkdir -p $(SERVER_DIR)/logs
 	mkdir -p $(SERVER_DIR)/models
 
@@ -38,7 +38,7 @@ test-server:
 		-d '{"model": "mistral", "messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 50}'
 
 run-server:
-	cd $(SERVER_DIR) && ../$(VENV_DIR)/bin/python server.py
+	cd $(SERVER_DIR) && ./$(VENV_DIR)/bin/python server.py
 
 run-client:
 	$(PYTHON) audio_processor.py

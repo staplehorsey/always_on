@@ -13,7 +13,7 @@ An OpenAI-compatible API server for running Mistral-7B locally.
 The server is configured for optimal performance on the GTX 1080 Ti with memory constraints:
 - Uses float16 precision (bfloat16 not supported on compute capability < 8.0)
 - 4096 token context window (reduced for memory efficiency)
-- AWQ quantization for reduced memory usage
+- GPTQ 4-bit quantization for reduced memory usage
 - 70% GPU memory utilization
 - Single sequence processing
 - Memory expansion enabled via PyTorch settings
@@ -26,7 +26,7 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 # Engine settings
 engine_args = AsyncEngineArgs(
-    model="mistralai/Mistral-7B-Instruct-v0.3",
+    model="TheBloke/Mistral-7B-Instruct-v0.2-GPTQ",  # Pre-quantized model
     download_dir="models",
     gpu_memory_utilization=0.7,      # Reduced to avoid OOM
     tensor_parallel_size=1,          # Single GPU setup
@@ -36,7 +36,7 @@ engine_args = AsyncEngineArgs(
     enforce_eager=True,             # More stable on older GPUs
     max_num_batched_tokens=4096,    # Limit batch size
     max_num_seqs=1,                 # Process one sequence at a time
-    quantization="awq"             # Enable quantization
+    quantization="gptq"            # Use GPTQ quantization
 )
 
 ### Memory Management Tips
@@ -44,7 +44,7 @@ engine_args = AsyncEngineArgs(
   1. Further reduce `gpu_memory_utilization` (try 0.6 or 0.5)
   2. Reduce `max_model_len` (try 2048)
   3. Use stricter `max_num_batched_tokens` (try 2048)
-  4. Consider using 4-bit quantization instead of AWQ
+  4. Try a different quantized model from TheBloke's collection
   5. Clear CUDA cache between requests if needed
 
 ## Installation

@@ -50,17 +50,16 @@ app.add_middleware(
 
 # Initialize LLM Engine
 engine_args = AsyncEngineArgs(
-    model="TheBloke/Mistral-7B-OpenOrca-GPTQ",  # Switch to GPTQ-quantized model
-    download_dir=models_dir,  # Use absolute path to models directory
-    gpu_memory_utilization=0.7,  # Reduced to avoid OOM
+    model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",  # Much smaller model, works well on 1080 Ti
+    download_dir=models_dir,
+    gpu_memory_utilization=0.8,  # Can use more memory with smaller model
     tensor_parallel_size=1,
     dtype="float16",
     trust_remote_code=True,
-    max_model_len=4096,  # Reduced context window
+    max_model_len=2048,  # Reduced for better memory usage
     enforce_eager=True,
-    max_num_batched_tokens=4096,  # Limit batch size
-    max_num_seqs=1,  # Process one sequence at a time
-    quantization="gptq"  # Use GPTQ quantization
+    max_num_batched_tokens=2048,
+    max_num_seqs=1
 )
 engine = None
 

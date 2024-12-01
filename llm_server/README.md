@@ -1,6 +1,6 @@
 # Local LLM Server
 
-An OpenAI-compatible API server for running Mistral-7B locally.
+An OpenAI-compatible API server for running TinyLlama locally.
 
 ## Requirements
 
@@ -12,9 +12,9 @@ An OpenAI-compatible API server for running Mistral-7B locally.
 
 The server is configured for optimal performance on the GTX 1080 Ti with memory constraints:
 - Uses float16 precision (bfloat16 not supported on compute capability < 8.0)
-- 4096 token context window (reduced for memory efficiency)
-- 4-bit GPTQ quantization for reduced memory usage
-- 70% GPU memory utilization
+- 2048 token context window (reduced for memory efficiency)
+- TinyLlama 1.1B model (optimized for consumer GPUs)
+- 80% GPU memory utilization
 - Single sequence processing
 - Memory expansion enabled via PyTorch settings
 
@@ -26,26 +26,24 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 # Engine settings
 engine_args = AsyncEngineArgs(
-    model="TheBloke/Mistral-7B-OpenOrca-GPTQ",  # 4-bit quantized model
+    model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",  # Smaller model for better compatibility
     download_dir="models",
-    gpu_memory_utilization=0.7,      # Reduced to avoid OOM
+    gpu_memory_utilization=0.8,      # Can use more memory with smaller model
     tensor_parallel_size=1,          # Single GPU setup
     dtype="float16",                # Required for GTX 1080 Ti
     trust_remote_code=True,
-    max_model_len=4096,             # Reduced context window
+    max_model_len=2048,             # Reduced context window
     enforce_eager=True,             # More stable on older GPUs
-    max_num_batched_tokens=4096,    # Limit batch size
-    max_num_seqs=1,                 # Process one sequence at a time
-    quantization="gptq"            # Use GPTQ quantization
+    max_num_batched_tokens=2048,    # Smaller batches for stability
+    max_num_seqs=1                  # Process one sequence at a time
 )
 
 ### Memory Management Tips
 - If you're still experiencing OOM errors:
-  1. Further reduce `gpu_memory_utilization` (try 0.6 or 0.5)
-  2. Reduce `max_model_len` (try 2048)
-  3. Use stricter `max_num_batched_tokens` (try 2048)
-  4. Try a different GPTQ model with lower precision
-  5. Clear CUDA cache between requests if needed
+  1. Reduce `gpu_memory_utilization` (try 0.7 or 0.6)
+  2. Further reduce `max_model_len` (try 1024)
+  3. Reduce `max_num_batched_tokens` (try 1024)
+  4. Clear CUDA cache between requests if needed
 
 ## Installation
 
@@ -78,7 +76,7 @@ openai.api_key = "dummy"  # Not used but required
 openai.api_base = "http://localhost:8000/v1"
 
 response = openai.ChatCompletion.create(
-    model="mistral",  # Model name doesn't matter, server uses Mistral
+    model="tinyllama",  # Model name doesn't matter, server uses TinyLlama
     messages=[
         {"role": "user", "content": "Hello, how are you?"}
     ],

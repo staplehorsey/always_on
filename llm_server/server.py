@@ -106,10 +106,11 @@ async def startup_event():
         
         # Log model information
         logger.info(f"Model loaded successfully:")
+        logger.info(f"- Model path: {llm.model_path}")
         logger.info(f"- Context window: {llm.n_ctx()}")
         logger.info(f"- Vocabulary size: {llm.n_vocab()}")
-        logger.info(f"- Model parameters: {llm.model_path}")
-        logger.info(f"- GPU layers loaded: {llm._n_gpu_layers}")
+        logger.info(f"- Memory per token: {llm.memory_per_token()} bytes")
+        logger.info(f"- System memory: {psutil.Process().memory_info().rss / (1024 * 1024):.2f} MB")
         
         # Force another GC after model load
         gc.collect()

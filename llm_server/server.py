@@ -109,7 +109,6 @@ async def startup_event():
         logger.info(f"- Model path: {llm.model_path}")
         logger.info(f"- Context window: {llm.n_ctx()}")
         logger.info(f"- Vocabulary size: {llm.n_vocab()}")
-        logger.info(f"- Memory per token: {llm.memory_per_token()} bytes")
         logger.info(f"- System memory: {psutil.Process().memory_info().rss / (1024 * 1024):.2f} MB")
         
         # Force another GC after model load

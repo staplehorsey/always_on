@@ -92,16 +92,14 @@ async def startup_event():
         logger.info("Initializing model with conservative memory settings...")
         llm = Llama(
             model_path=model_path,
-            n_gpu_layers=20,        # Reduced from 35 for stability
-            n_ctx=2048,            # Reduced context window
-            n_batch=256,           # Smaller batch size
-            verbose=True,          # Keep verbose for debugging
-            f16_kv=True,          # Use float16 for key/value cache
-            use_mmap=True,        # Use memory mapping
-            use_mlock=False,      # Don't lock memory
-            embedding=False,       # Disable embedding to save memory
-            logits_all=False,     # Don't compute all logits
-            vocab_only=False      # Load full model
+            n_ctx=512,  # Reduced from 2048
+            n_batch=32,  # Reduced from 256
+            n_gpu_layers=1,  # Start with minimal GPU usage
+            verbose=True,
+            seed=42,
+            f16_kv=True,  # Use float16 for key/value cache
+            logits_all=False,  # Disable unused feature
+            embedding=False,  # Disable unused feature
         )
         
         # Log model information
@@ -124,18 +122,18 @@ async def create_chat_completion(request: GenerateRequest):
         logger.info("Starting request processing")
         logger.info(f"Received prompt: {request.prompt[:100]}...")
         
-        # Format prompt for chat
-        prompt = f"### Human: {request.prompt}\n### Assistant: "
+        # Format prompt for chat (with length limit)
+        prompt = f"### Human: {request.prompt[:1000]}\n### Assistant: "  # Limit input length
         logger.info("Formatted prompt")
         
-        # Generate response with error handling
+        # Generate response with error handling and timeout
         try:
             logger.info("Starting generation...")
             response = llm(
                 prompt,
-                max_tokens=min(request.max_tokens, 1024),  # Limit max tokens
-                temperature=request.temperature,
-                top_p=request.top_p,
+                max_tokens=min(request.max_tokens, 256),  # Further limit output tokens
+                temperature=min(request.temperature, 0.8),  # Cap temperature
+                top_p=min(request.top_p, 0.9),  # Cap top_p
                 stop=request.stop or ["### Human:", "\n### Human:"],
                 echo=False
             )

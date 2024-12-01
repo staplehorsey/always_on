@@ -1,0 +1,19 @@
+[Unit]
+Description=Audio Processor Service
+After=llm-server.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=1
+User=root
+WorkingDirectory=/opt/always_on
+Environment=PYTHONPATH=/opt/always_on
+ExecStart=/opt/always_on/venv/bin/python audio_processor.py
+
+StandardOutput=append:/opt/always_on/logs/audio_processor.log
+StandardError=append:/opt/always_on/logs/audio_processor.error.log
+
+[Install]
+WantedBy=multi-user.target

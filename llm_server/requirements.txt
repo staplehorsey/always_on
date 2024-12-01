@@ -1,6 +1,6 @@
 --extra-index-url https://download.pytorch.org/whl/cu118
-torch==2.1.2+cu118
-transformers==4.36.2
+torch==2.5.1+cu118
+transformers==4.46.3
 fastapi==0.104.1
 uvicorn==0.24.0
 pydantic==2.5.1

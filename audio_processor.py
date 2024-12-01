@@ -5,7 +5,6 @@ import time
 import queue
 import socket
 import logging
-import asyncio
 import threading
 import traceback
 from pathlib import Path
@@ -53,7 +52,17 @@ class AudioProcessor:
             api_key="sk-no-key-required"
         )
         
-        # Audio processing parameters
+        # Processing queue
+        self.max_queue_size = 10
+        self.processing_queue = queue.Queue(maxsize=self.max_queue_size)
+        self.shutdown_flag = threading.Event()
+        
+        # Start processing thread
+        self.processing_thread = threading.Thread(target=self._process_queue)
+        self.processing_thread.daemon = True
+        self.processing_thread.start()
+        
+        # Audio parameters
         self.target_sample_rate = 16000  # Required by Whisper
         self.server_sample_rate = 44100  # Server's sample rate
         self.is_recording = False
@@ -68,17 +77,11 @@ class AudioProcessor:
         self.audio_buffer_idx = 0
         
         # Speech detection parameters
-        self.speech_threshold = 0.01
+        self.speech_threshold = 0.5  # Silero VAD threshold
         self.min_speech_duration = 1.0  # seconds
         self.speech_cooldown = 1.5  # seconds
-        self.silence_threshold = 0.005
         self.consecutive_silence = 0
-        
-        # Processing queue
-        self.max_queue_size = 10
-        self.processing_queue = asyncio.Queue(maxsize=self.max_queue_size)
-        self.queue_processor_task = None  # Will store the queue processor task
-        self.queue_processor_running = True  # Control flag for the processor
+        self.last_speech_time = 0
         
         # Audio monitoring setup
         self.enable_monitoring = True
@@ -123,7 +126,7 @@ class AudioProcessor:
         
         return resampled
 
-    async def process_audio_chunk(self, chunk):
+    def process_audio_chunk(self, chunk):
         """Process a chunk of audio data"""
         try:
             # Convert bytes to float32 array
@@ -140,10 +143,10 @@ class AudioProcessor:
                 except Exception as e:
                     logger.error(f"Error playing audio: {e}")
             
-            # Resample and normalize for VAD processing
+            # Resample from server rate to target rate for VAD/processing
             resampled = self.resample_audio(original_samples, self.server_sample_rate, self.target_sample_rate)
             
-            # Add to monitoring buffer (use resampled audio for VAD)
+            # Add to monitoring buffer
             self.monitoring_buffer = np.concatenate((self.monitoring_buffer, resampled))
             
             # Process resampled audio in VAD-sized chunks
@@ -180,65 +183,93 @@ class AudioProcessor:
                     
                     # Handle speech detection with cooldown and padding
                     if speech_prob > self.speech_threshold:
-                        self.is_recording = True
-                        self.consecutive_silence = 0
-                        
-                        if not self.current_recording:
+                        if not self.is_recording:
                             logger.info("Speech detected, starting recording...")
-                            self.current_recording = self.monitoring_buffer.tolist()
+                            self.is_recording = True
+                            # Include some previous audio for context
+                            buffer_duration = len(self.monitoring_buffer) / self.target_sample_rate
+                            padding_samples = min(int(0.5 * self.target_sample_rate), len(self.monitoring_buffer))
+                            self.current_recording = self.monitoring_buffer[-padding_samples:].tolist()
                         
+                        self.consecutive_silence = 0
+                        self.last_speech_time = current_time
                         self.current_recording.extend(self.audio_buffer.tolist())
-                    else:
-                        # Only stop recording if we've been silent for longer than the cooldown
-                        if self.is_recording:
-                            self.consecutive_silence += len(self.audio_buffer) / self.target_sample_rate
-                            if self.consecutive_silence >= self.speech_cooldown:
-                                recording_duration = len(self.current_recording) / self.target_sample_rate
-                                if recording_duration >= self.min_speech_duration:
-                                    logger.info("Speech ended, processing recording...")
-                                    self.is_recording = False
-                                    
-                                    # Add trailing silence as padding
-                                    pad_samples = int(self.monitoring_buffer_duration * self.target_sample_rate)
-                                    if len(self.monitoring_buffer) > pad_samples:
-                                        self.current_recording.extend(self.monitoring_buffer[-pad_samples:].tolist())
-                                    
-                                    # Add to processing queue
-                                    await self._add_to_queue(np.array(self.current_recording))
-                                else:
-                                    logger.debug(f"Discarding short speech segment ({recording_duration:.2f}s)")
-                                self.current_recording = []
-                                self.consecutive_silence = 0
+                    elif self.is_recording:
+                        # Calculate silence duration
+                        silence_duration = current_time - self.last_speech_time
+                        
+                        # Keep recording during silence up to cooldown
+                        self.current_recording.extend(self.audio_buffer.tolist())
+                        
+                        if silence_duration >= self.speech_cooldown:
+                            # Check if recording meets minimum duration
+                            recording_duration = len(self.current_recording) / self.target_sample_rate
+                            if recording_duration >= self.min_speech_duration:
+                                logger.info("Speech ended, processing recording...")
+                                # Add a bit of trailing silence
+                                padding_samples = min(int(0.5 * self.target_sample_rate), len(self.monitoring_buffer))
+                                self.current_recording.extend(self.monitoring_buffer[-padding_samples:].tolist())
+                                # Process the recording
+                                self._add_to_queue(np.array(self.current_recording))
                             else:
-                                # Keep recording during the cooldown period
-                                self.current_recording.extend(self.audio_buffer.tolist())
+                                logger.debug(f"Discarding short speech segment ({recording_duration:.2f}s)")
+                            
+                            # Reset recording state
+                            self.is_recording = False
+                            self.current_recording = []
                     
                     # Reset buffer
                     self.audio_buffer = np.zeros(self.vad_frame_size, dtype=np.float32)
                     self.audio_buffer_idx = 0
             
-            # Trim monitoring buffer to save memory
-            max_buffer_samples = int((self.monitoring_buffer_duration * 2) * self.target_sample_rate)
-            if len(self.monitoring_buffer) > max_buffer_samples:
-                self.monitoring_buffer = self.monitoring_buffer[-max_buffer_samples:]
+            # Trim monitoring buffer to save memory (keep last 2 seconds)
+            max_samples = 2 * self.target_sample_rate
+            if len(self.monitoring_buffer) > max_samples:
+                self.monitoring_buffer = self.monitoring_buffer[-max_samples:]
             
         except Exception as e:
             logger.error(f"Error processing audio chunk: {e}")
             logger.error(traceback.format_exc())
             self.audio_buffer = np.zeros(self.vad_frame_size, dtype=np.float32)
+            self.audio_buffer_idx = 0
 
-    async def _process_recording(self, audio_array):
+    def _process_queue(self):
+        """Process recordings from the queue"""
+        while not self.shutdown_flag.is_set():
+            try:
+                # Get the next recording from the queue with timeout
+                try:
+                    audio_array = self.processing_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                
+                # Process the recording
+                self._process_recording(audio_array)
+                
+                # Mark task as done
+                self.processing_queue.task_done()
+            except Exception as e:
+                logger.error(f"Error in queue processor: {str(e)}")
+                logger.error(traceback.format_exc())
+                continue
+
+    def _add_to_queue(self, audio_array):
+        """Add recording to processing queue"""
+        try:
+            if self.processing_queue.qsize() >= self.max_queue_size:
+                logger.warning("Queue full, dropping recording")
+                return
+                
+            self.processing_queue.put(audio_array)
+            logger.info(f"Added recording to queue. Queue size: {self.processing_queue.qsize()}")
+        except Exception as e:
+            logger.error(f"Error adding to queue: {str(e)}")
+
+    def _process_recording(self, audio_array):
         """Process a single recording"""
         try:
-            # Convert audio to float32 for Whisper
-            audio_array = np.array(audio_array, dtype=np.float32)
-            
-            # Ensure audio is in the correct range [-1, 1]
-            if audio_array.max() > 1 or audio_array.min() < -1:
-                audio_array = np.clip(audio_array, -1, 1)
-            
             # Transcribe with Whisper
-            logger.info("Transcribing audio with Whisper...")
+            logger.info("Transcribing audio...")
             result = self.model.transcribe(audio_array)
             transcript = result["text"].strip()
             
@@ -256,7 +287,6 @@ class AudioProcessor:
             else:
                 # Generate title and summary using local LLM
                 logger.info("Generating title and summary...")
-                logger.info(f"Transcript length: {len(transcript)} chars")
                 
                 # Truncate transcript if too long
                 max_transcript_chars = 1000  # Conservative limit to leave room for prompt
@@ -279,10 +309,9 @@ Requirements:
 Output format:
 {{"title": "Your Title Here", "summary": "Your summary here."}}"""
 
-                # Use non-async OpenAI client since llama.cpp doesn't support async
                 try:
                     response = self.openai_client.chat.completions.create(
-                        model="mistral",  # Model name doesn't matter for llama.cpp
+                        model="mistral",
                         messages=[
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_prompt}
@@ -323,94 +352,42 @@ Output format:
                         title_words.extend(['audio', 'recording'][:2 - len(title_words)])
                     
                     title = " ".join(word.capitalize() for word in title_words)
-                    
-                    # Create a meaningful summary from transcript content
-                    first_sentence = f"Discussion about {' '.join(title_words)}."
-                    second_sentence = "The conversation explores various topics and ideas."
-                    summary = f"{first_sentence} {second_sentence}"
+                    summary = f"Audio recording about {' '.join(title_words)}."
             
-            # Get current date/time information
+            # Save the recording
             now = datetime.now()
             year = now.strftime("%Y")
-            month = now.strftime("%m-%B")  # 01-January, 02-February, etc.
-            day = now.strftime("%d-%A")    # 01-Monday, 02-Tuesday, etc.
-            timestamp = now.strftime("%H-%M-%S")  # 24-hour format for better sorting
+            month = now.strftime("%m-%B")
+            day = now.strftime("%d-%A")
+            timestamp = now.strftime("%H-%M-%S")
             
-            # Clean the title to be filesystem-friendly
+            # Clean the title
             clean_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()
             
-            # Create the directory structure: recordings/YYYY/MM-Month/DD-Day/HHMMSS_Title
-            dir_name = os.path.join(
-                "recordings",
-                year,
-                month,
-                day,
-                f"{timestamp}_{clean_title}"
-            )
+            # Create directory structure
+            dir_name = os.path.join("recordings", year, month, day, f"{timestamp}_{clean_title}")
             os.makedirs(dir_name, exist_ok=True)
             
-            # Save audio file
+            # Save files
             logger.info(f"Saving recording to {dir_name}...")
             import scipy.io.wavfile as wavfile
-            wavfile.write(f"{dir_name}/audio.wav", self.target_sample_rate, audio_array.astype(np.float32))
+            wavfile.write(f"{dir_name}/audio.wav", self.target_sample_rate, audio_array)
             
-            # Save transcript
             with open(f"{dir_name}/transcript.txt", 'w') as f:
                 f.write(transcript)
             
-            # Save summary
             with open(f"{dir_name}/summary.txt", 'w') as f:
                 f.write(f"Title: {title}\n\nSummary:\n{summary}\n\nFull Transcript:\n{transcript}")
             
             logger.info(f"Processing complete. Files saved to: {dir_name}")
         except Exception as e:
-            logger.error(f"Error processing recording: {str(e)}")
+            logger.error(f"Error processing recording: {e}")
             logger.error(traceback.format_exc())
 
-    async def _process_queue(self):
-        """Process recordings in the queue"""
-        logger.info("Starting queue processor...")
-        while self.queue_processor_running:
-            try:
-                # Get recording from queue with timeout
-                try:
-                    audio_array = await asyncio.wait_for(self.processing_queue.get(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    continue
-                
-                # Process recording
-                try:
-                    await self._process_recording(audio_array)
-                except Exception as e:
-                    logger.error(f"Error processing recording: {str(e)}")
-                finally:
-                    # Mark task as done
-                    self.processing_queue.task_done()
-                    
-            except Exception as e:
-                logger.error(f"Error in queue processor: {str(e)}")
-                continue
-
-    async def _add_to_queue(self, audio_array):
-        """Add recording to processing queue"""
-        try:
-            if self.processing_queue.qsize() >= self.max_queue_size:
-                logger.warning("Queue full, dropping recording")
-                return
-                
-            await self.processing_queue.put(audio_array)
-            logger.info(f"Added recording to queue. Queue size: {self.processing_queue.qsize()}")
-        except Exception as e:
-            logger.error(f"Error adding to queue: {str(e)}")
-
-    async def run(self):
+    def run(self):
         """Main processing loop"""
         try:
             logger.info("Starting audio processing...")
-            
-            # Start queue processor task
-            self.queue_processor_running = True
-            self.queue_processor_task = asyncio.create_task(self._process_queue())
             
             # Connect to audio server
             logger.info(f"Connecting to {self.server_host}:{self.server_port}...")
@@ -420,14 +397,6 @@ Output format:
             # Start audio monitoring if enabled
             if self.enable_monitoring:
                 logger.info("Audio monitoring enabled - you should hear the incoming audio")
-                # Setup input stream for recording
-                self.audio_input_stream = sd.InputStream(
-                    channels=1,
-                    samplerate=self.target_sample_rate,
-                    blocksize=1024,
-                    dtype=np.float32
-                )
-                self.audio_input_stream.start()
                 self.audio_output_stream.start()
             
             while True:
@@ -438,7 +407,7 @@ Output format:
                     
                     # Convert bytes to float32 array
                     audio_chunk = np.frombuffer(data, dtype=np.float32)
-                    await self.process_audio_chunk(audio_chunk)
+                    self.process_audio_chunk(audio_chunk)
                     
                 except socket.timeout:
                     continue
@@ -451,31 +420,25 @@ Output format:
         except Exception as e:
             logger.error(f"Error in main loop: {e}")
         finally:
-            await self.cleanup()
-            
-    async def cleanup(self):
+            self.cleanup()
+
+    def cleanup(self):
         """Clean up resources"""
         logger.info("Cleaning up resources...")
         
         # Stop queue processor
         logger.info("Stopping queue processor...")
-        self.queue_processor_running = False
-        if self.queue_processor_task:
-            try:
-                await asyncio.wait_for(self.queue_processor_task, timeout=5.0)
-            except asyncio.TimeoutError:
-                logger.warning("Queue processor task did not finish in time")
-            except Exception as e:
-                logger.error(f"Error stopping queue processor: {e}")
+        self.shutdown_flag.set()
+        
+        # Wait for queue to finish with timeout
+        try:
+            logger.info("Waiting for processing queue to finish...")
+            self.processing_queue.join()
+        except Exception as e:
+            logger.error(f"Error waiting for queue: {e}")
         
         # Stop audio monitoring
         if self.enable_monitoring:
-            if hasattr(self, 'audio_input_stream'):
-                try:
-                    self.audio_input_stream.stop()
-                    self.audio_input_stream.close()
-                except Exception as e:
-                    logger.error(f"Error closing input stream: {e}")
             if hasattr(self, 'audio_output_stream'):
                 try:
                     self.audio_output_stream.stop()
@@ -496,15 +459,6 @@ Output format:
             except Exception as e:
                 logger.error(f"Error closing OpenAI client: {e}")
         
-        # Wait for processing queue to finish with timeout
-        try:
-            logger.info("Waiting for processing queue to finish (max 10s)...")
-            await asyncio.wait_for(self.processing_queue.join(), timeout=10.0)
-        except asyncio.TimeoutError:
-            logger.warning("Timed out waiting for processing queue")
-        except Exception as e:
-            logger.error(f"Error waiting for processing queue: {e}")
-        
         logger.info("Cleanup complete")
 
     def _audio_callback(self, indata, frames, time, status):
@@ -524,6 +478,6 @@ Output format:
 if __name__ == "__main__":
     processor = AudioProcessor()
     try:
-        asyncio.run(processor.run())
+        processor.run()
     except KeyboardInterrupt:
         pass

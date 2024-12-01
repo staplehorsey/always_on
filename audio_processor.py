@@ -1,336 +1,333 @@
 import os
+import sys
 import json
-import numpy as np
-import sounddevice as sd
-import whisper
-import torch
 import time
 import queue
-import threading
-import re
-import openai
+import socket
 import logging
-import logging.handlers
+import asyncio
+import threading
+import traceback
+from pathlib import Path
 from datetime import datetime
-import aiohttp
-from scipy.io import wavfile
+
+import numpy as np
+import torch
+import whisper
+import openai
+import sounddevice as sd
+from scipy import signal
 
 # Set up logging
-os.makedirs('logs', exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.handlers.RotatingFileHandler(
-            'logs/audio_processor.log',
-            maxBytes=10485760,  # 10MB
-            backupCount=5
-        ),
-        logging.StreamHandler()
-    ]
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
 logger = logging.getLogger('audio-processor')
 
 class AudioProcessor:
-    def __init__(self):
-        logger.info("Initializing audio processor...")
-        # Set tokenizer parallelism to avoid fork warnings
-        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    def __init__(self, server_host='staple.local', server_port=12345):
+        self.server_host = server_host
+        self.server_port = server_port
         
-        # Initialize device
-        self.device = torch.device('cpu')  # Using CPU for VAD model
-        logger.info(f"Using device: {self.device}")
+        # Initialize socket
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.settimeout(0.1)  # 100ms timeout for non-blocking recv
         
-        # Initialize queues
-        self.processing_queue = queue.Queue()
-        self.summarization_queue = queue.Queue()
-        self.max_queue_size = 10  # Maximum number of pending recordings
+        # Initialize Whisper model
+        logger.info("Loading Whisper model...")
+        self.model = whisper.load_model("base")
         
-        # Initialize model ready event
-        self.model_ready = threading.Event()
+        # Initialize VAD model
+        logger.info("Loading VAD model...")
+        torch.hub.set_dir(os.path.expanduser('~/.cache/torch/hub'))
+        self.vad_model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad',
+                                             model='silero_vad',
+                                             force_reload=False)
+        self.vad_model.eval()
         
         # Initialize OpenAI client for local server
-        openai.api_key = "dummy"  # Not used but required
-        openai.api_base = "http://rat.local:8080/v1"
-        self.openai_client = openai.Client(
-            api_key="dummy",
-            base_url="http://rat.local:8080/v1"
+        self.openai_client = openai.OpenAI(
+            base_url="http://rat.local:8080/v1",
+            api_key="sk-no-key-required"
         )
         
-        # Initialize models in separate threads
-        
-        self.shutdown_flag = threading.Event()
-        
-        # Start model initialization thread
-        self.init_thread = threading.Thread(target=self._initialize_models)
-        self.init_thread.start()
-        
-        # Start processing threads
-        self.processing_thread = threading.Thread(target=self._process_queue)
-        self.processing_thread.daemon = True
-        self.processing_thread.start()
-        
-        # Audio parameters
-        self.sample_rate = 16000
-        self.vad_frame_samples = 512  # Silero VAD expects 512 samples for 16kHz
-        self.buffer_duration = 60  # Total buffer duration in seconds
-        self.padding_duration = 30  # Padding before and after speech
-        
-        # State variables
-        self.recording_buffer = np.array([], dtype=np.float32)
-        self.monitoring_buffer = np.array([], dtype=np.float32)
-        self.vad_buffer = np.array([], dtype=np.float32)  # Buffer for VAD processing
+        # Audio processing parameters
+        self.target_sample_rate = 16000  # Required by Whisper
+        self.server_sample_rate = 44100  # Server's sample rate
         self.is_recording = False
-        self.speech_detected = False
-        self.last_speech_end = 0
+        self.current_recording = []
+        self.monitoring_buffer = np.array([], dtype=np.float32)
+        self.monitoring_buffer_duration = 0.5  # seconds
+        self.monitoring_buffer_samples = int(self.target_sample_rate * self.monitoring_buffer_duration)
         
-        # Wait for models to be ready
-        logger.info("Waiting for models to initialize...")
-        self.model_ready.wait()
+        # VAD parameters
+        self.vad_frame_size = 512  # VAD requires 512 samples for 16kHz
+        self.audio_buffer = np.zeros(self.vad_frame_size, dtype=np.float32)
+        self.audio_buffer_idx = 0
+        
+        # Speech detection parameters
+        self.speech_threshold = 0.01
+        self.min_speech_duration = 1.0  # seconds
+        self.speech_cooldown = 1.5  # seconds
+        self.silence_threshold = 0.005
+        self.consecutive_silence = 0
+        
+        # Processing queue
+        self.max_queue_size = 10
+        self.processing_queue = asyncio.Queue(maxsize=self.max_queue_size)
+        self.queue_processor_task = None  # Will store the queue processor task
+        self.queue_processor_running = True  # Control flag for the processor
+        
+        # Audio monitoring setup
+        self.enable_monitoring = True
+        if self.enable_monitoring:
+            # Setup output stream for monitoring at server's sample rate
+            self.audio_output_stream = sd.OutputStream(
+                channels=1,
+                samplerate=self.server_sample_rate,  # Use server's sample rate for playback
+                blocksize=1024,
+                dtype=np.float32
+            )
+        
         logger.info("Initialization complete")
 
-    def _initialize_models(self):
-        try:
-            logger.info("Initializing models...")
-            logger.info(f"Device: {self.device}")
+    def resample_audio(self, audio_data, orig_sr, target_sr):
+        """Resample audio data to target sample rate while preserving signal characteristics"""
+        if orig_sr == target_sr:
+            return audio_data
             
-            logger.info("Loading VAD model...")
-            start_time = time.time()
-            self.vad_model, utils = torch.hub.load(repo_or_dir="snakers4/silero-vad",
-                                                 model="silero_vad",
-                                                 force_reload=False,
-                                                 onnx=False)
-            self.vad_model.eval()
-            logger.info(f"VAD model loaded in {time.time() - start_time:.2f} seconds")
-            
-            logger.info("Loading Whisper model...")
-            start_time = time.time()
-            self.whisper_model = whisper.load_model("base")
-            logger.info(f"Whisper model loaded in {time.time() - start_time:.2f} seconds")
-            
-            # Test LLM server connection
-            try:
-                response = self.openai_client.chat.completions.create(
-                    model="mistral",
-                    messages=[{"role": "user", "content": "Test connection"}],
-                    max_tokens=10
-                )
-                logger.info("LLM server connection successful!")
-            except Exception as e:
-                logger.warning(f"Could not connect to LLM server: {str(e)}")
-                logger.warning("Make sure the server is running on http://localhost:8000")
-            
-            # Signal that models are ready
-            self.model_ready.set()
-            logger.info("All models initialized successfully!")
-        except Exception as e:
-            logger.error(f"Error initializing models: {str(e)}")
-            logger.error(f"Error type: {type(e)}")
-            import traceback
-            logger.error("Traceback:", exc_info=True)
-            self.shutdown_flag.set()
-    
-    def _process_queue(self):
-        """Process audio recordings from the queue"""
-        while not self.shutdown_flag.is_set():
-            try:
-                # Get the next recording from the queue
-                audio_array = self.processing_queue.get(timeout=1.0)
-                
-                # Process the recording
-                self._process_recording(audio_array)
-                
-                # Mark task as done
-                self.processing_queue.task_done()
-            except queue.Empty:
-                continue
-            except Exception as e:
-                logger.error(f"Error processing recording: {str(e)}")
-                continue
-    
-    async def generate_summary(self, transcript: str) -> str:
-        """Generate a summary of the transcript using the LLM API."""
-        try:
-            prompt = f"[INST] Please summarize this conversation or audio transcript. Focus on the key points and main ideas:\n\n{transcript}\n\nProvide a concise summary that captures the essential information. [/INST]"
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post("http://rat.local:8080/completion", 
-                    json={
-                        "prompt": prompt,
-                        "temperature": 0.7,
-                        "top_k": 40,
-                        "top_p": 0.95,
-                        "n_predict": 256,
-                        "stop": ["[INST]", "</s>"],
-                        "stream": False
-                    }
-                ) as response:
-                    if response.status != 200:
-                        raise Exception(f"LLM API error: {response.status}")
-                    
-                    result = await response.json()
-                    return result["content"].strip()
-                    
-        except Exception as e:
-            logger.error(f"Failed to generate summary: {e}")
-            return f"Error generating summary: {str(e)}"
+        # Calculate resampling ratio
+        ratio = target_sr / orig_sr
+        
+        # Normalize the signal to [-1, 1] range before resampling
+        if np.max(np.abs(audio_data)) > 0:
+            audio_data = audio_data / np.max(np.abs(audio_data))
+        
+        # Apply low-pass filter to prevent aliasing
+        nyquist = min(orig_sr, target_sr) / 2
+        cutoff = 0.9 * nyquist  # Leave some margin
+        b = signal.firwin(101, cutoff, fs=orig_sr)
+        audio_data = signal.filtfilt(b, [1.0], audio_data)
+        
+        # Calculate number of samples for output
+        output_samples = int(len(audio_data) * ratio)
+        
+        # Resample using scipy's resample function
+        resampled = signal.resample(audio_data, output_samples)
+        
+        # Ensure consistent amplitude after resampling
+        if np.max(np.abs(resampled)) > 0:
+            resampled = resampled / np.max(np.abs(resampled))
+        
+        return resampled
 
-    def audio_callback(self, indata, frames, time_info, status):
-        if status:
-            logger.warning(f"Status: {status}")
-        
-        # Convert to mono if necessary and add to buffer
-        audio_data = indata[:, 0] if indata.ndim > 1 else indata.flatten()
-        audio_data = audio_data.astype(np.float32)
-        
-        # Add to monitoring buffer
-        self.monitoring_buffer = np.concatenate((self.monitoring_buffer, audio_data))
-        
-        # Add to VAD buffer
-        self.vad_buffer = np.concatenate((self.vad_buffer, audio_data))
-        
-        # Process complete VAD frames
-        while len(self.vad_buffer) >= self.vad_frame_samples:
-            # Get a frame
-            frame = self.vad_buffer[:self.vad_frame_samples]
-            self.vad_buffer = self.vad_buffer[self.vad_frame_samples:]
-            
-            # Process with Silero VAD
-            audio_tensor = torch.FloatTensor(frame).to(self.device)
-            speech_prob = self.vad_model(audio_tensor, self.sample_rate).item()
-            
-            current_time = time.time()
-            if speech_prob > 0.5:
-                self.speech_detected = True
-                self.last_speech_end = current_time
-                if not self.is_recording:
-                    self.start_recording()
-            elif self.speech_detected and (current_time - self.last_speech_end) > self.padding_duration:
-                self.stop_recording()
-        
-        # If we're recording, add to recording buffer
-        if self.is_recording:
-            self.recording_buffer = np.concatenate((self.recording_buffer, audio_data))
-    
-    def start_recording(self):
-        logger.info("Speech detected, starting recording...")
-        self.is_recording = True
-        # Initialize recording buffer with the padding buffer
-        self.recording_buffer = self.monitoring_buffer.astype(np.float32)  # Ensure float32
-    
-    def stop_recording(self):
-        if not self.is_recording:
-            return
-            
-        logger.info("Stopping recording...")
-        self.is_recording = False
-        self.speech_detected = False
-        
-        # Convert recording buffer to numpy array
-        audio_array = self.recording_buffer.astype(np.float32)
-        
-        # Only process if recording is longer than 10 seconds
-        if len(audio_array) > 10 * self.sample_rate:
-            # Add to processing queue if not full
-            if self.processing_queue.qsize() < self.max_queue_size:
-                logger.info("Adding recording to processing queue...")
-                self.processing_queue.put(audio_array)
-            else:
-                logger.warning("Warning: Processing queue full, skipping recording")
-        
-        # Clear recording buffer
-        self.recording_buffer = np.array([], dtype=np.float32)
-        self.monitoring_buffer = np.array([], dtype=np.float32)
-    
-    def _process_recording(self, audio_array):
-        """Process a single recording (called from the processing thread)"""
+    async def process_audio_chunk(self, chunk):
+        """Process a chunk of audio data"""
         try:
+            # Convert bytes to float32 array
+            original_samples = np.frombuffer(chunk, dtype=np.float32)
+            
+            # Play audio if monitoring is enabled (use original samples)
+            if self.enable_monitoring:
+                try:
+                    gain = 1.5  # Reduced gain to prevent distortion
+                    samples_to_play = original_samples * gain
+                    # Clip to prevent distortion
+                    samples_to_play = np.clip(samples_to_play, -1.0, 1.0)
+                    self.audio_output_stream.write(samples_to_play)
+                except Exception as e:
+                    logger.error(f"Error playing audio: {e}")
+            
+            # Resample and normalize for VAD processing
+            resampled = self.resample_audio(original_samples, self.server_sample_rate, self.target_sample_rate)
+            
+            # Add to monitoring buffer (use resampled audio for VAD)
+            self.monitoring_buffer = np.concatenate((self.monitoring_buffer, resampled))
+            
+            # Process resampled audio in VAD-sized chunks
+            remaining_samples = len(resampled)
+            processed_samples = 0
+            
+            while remaining_samples > 0:
+                # Calculate how many samples we can add to the current buffer
+                space_in_buffer = self.vad_frame_size - self.audio_buffer_idx
+                samples_to_add = min(remaining_samples, space_in_buffer)
+                
+                # Add samples to buffer
+                self.audio_buffer[self.audio_buffer_idx:self.audio_buffer_idx + samples_to_add] = \
+                    resampled[processed_samples:processed_samples + samples_to_add]
+                
+                self.audio_buffer_idx += samples_to_add
+                processed_samples += samples_to_add
+                remaining_samples -= samples_to_add
+                
+                # If buffer is full, process it
+                if self.audio_buffer_idx >= self.vad_frame_size:
+                    # Ensure audio buffer is normalized for VAD
+                    vad_buffer = self.audio_buffer.copy()
+                    if np.max(np.abs(vad_buffer)) > 0:
+                        vad_buffer = vad_buffer / np.max(np.abs(vad_buffer))
+                    
+                    # Convert to torch tensor
+                    tensor = torch.from_numpy(vad_buffer).to('cuda' if torch.cuda.is_available() else 'cpu')
+                    tensor = tensor.unsqueeze(0)  # Add batch dimension
+                    
+                    # Run VAD
+                    speech_prob = self.vad_model(tensor, self.target_sample_rate).item()
+                    current_time = time.time()
+                    
+                    # Handle speech detection with cooldown and padding
+                    if speech_prob > self.speech_threshold:
+                        self.is_recording = True
+                        self.consecutive_silence = 0
+                        
+                        if not self.current_recording:
+                            logger.info("Speech detected, starting recording...")
+                            self.current_recording = self.monitoring_buffer.tolist()
+                        
+                        self.current_recording.extend(self.audio_buffer.tolist())
+                    else:
+                        # Only stop recording if we've been silent for longer than the cooldown
+                        if self.is_recording:
+                            self.consecutive_silence += len(self.audio_buffer) / self.target_sample_rate
+                            if self.consecutive_silence >= self.speech_cooldown:
+                                recording_duration = len(self.current_recording) / self.target_sample_rate
+                                if recording_duration >= self.min_speech_duration:
+                                    logger.info("Speech ended, processing recording...")
+                                    self.is_recording = False
+                                    
+                                    # Add trailing silence as padding
+                                    pad_samples = int(self.monitoring_buffer_duration * self.target_sample_rate)
+                                    if len(self.monitoring_buffer) > pad_samples:
+                                        self.current_recording.extend(self.monitoring_buffer[-pad_samples:].tolist())
+                                    
+                                    # Add to processing queue
+                                    await self._add_to_queue(np.array(self.current_recording))
+                                else:
+                                    logger.debug(f"Discarding short speech segment ({recording_duration:.2f}s)")
+                                self.current_recording = []
+                                self.consecutive_silence = 0
+                            else:
+                                # Keep recording during the cooldown period
+                                self.current_recording.extend(self.audio_buffer.tolist())
+                    
+                    # Reset buffer
+                    self.audio_buffer = np.zeros(self.vad_frame_size, dtype=np.float32)
+                    self.audio_buffer_idx = 0
+            
+            # Trim monitoring buffer to save memory
+            max_buffer_samples = int((self.monitoring_buffer_duration * 2) * self.target_sample_rate)
+            if len(self.monitoring_buffer) > max_buffer_samples:
+                self.monitoring_buffer = self.monitoring_buffer[-max_buffer_samples:]
+            
+        except Exception as e:
+            logger.error(f"Error processing audio chunk: {e}")
+            logger.error(traceback.format_exc())
+            self.audio_buffer = np.zeros(self.vad_frame_size, dtype=np.float32)
+
+    async def _process_recording(self, audio_array):
+        """Process a single recording"""
+        try:
+            # Convert audio to float32 for Whisper
+            audio_array = np.array(audio_array, dtype=np.float32)
+            
+            # Ensure audio is in the correct range [-1, 1]
+            if audio_array.max() > 1 or audio_array.min() < -1:
+                audio_array = np.clip(audio_array, -1, 1)
+            
             # Transcribe with Whisper
-            logger.info("Transcribing audio...")
-            result = self.whisper_model.transcribe(audio_array)
-            transcript = result["text"]
+            logger.info("Transcribing audio with Whisper...")
+            result = self.model.transcribe(audio_array)
+            transcript = result["text"].strip()
             
-            # Generate title and summary using Mistral
-            logger.info("\nGenerating title and summary...")
-            logger.info("Transcript length: %d chars", len(transcript))
+            if not transcript:
+                logger.warning("No transcript generated - skipping title/summary generation")
+                return
+                
+            logger.info(f"Transcription complete: {transcript}")
             
-            # Truncate transcript if too long (Mistral has a 2048 token limit)
-            max_transcript_chars = 1000  # Conservative limit to leave room for prompt
-            truncated_transcript = transcript[:max_transcript_chars]
-            if len(transcript) > max_transcript_chars:
-                truncated_transcript += "..."
-                logger.info(f"Truncated to {len(truncated_transcript)} chars")
-            
-            prompt = f'''<s>[INST] Create a title and summary for this transcript. The output must be valid JSON.
+            # Skip title/summary generation if OpenAI client is not available
+            if self.openai_client is None:
+                logger.warning("OpenAI client not available - skipping title/summary generation")
+                title = "Untitled Recording"
+                summary = "Summary not available (LLM service not connected)"
+            else:
+                # Generate title and summary using local LLM
+                logger.info("Generating title and summary...")
+                logger.info(f"Transcript length: {len(transcript)} chars")
+                
+                # Truncate transcript if too long
+                max_transcript_chars = 1000  # Conservative limit to leave room for prompt
+                truncated_transcript = transcript[:max_transcript_chars]
+                if len(transcript) > max_transcript_chars:
+                    truncated_transcript += "..."
+                    logger.info(f"Truncated to {len(truncated_transcript)} chars")
+                
+                system_prompt = """You are a helpful AI assistant that creates titles and summaries for audio transcripts.
+Your task is to create a concise title and informative summary. The output must be valid JSON."""
 
-Transcript: "{truncated_transcript}"
+                user_prompt = f"""Create a title and summary for this transcript:
+
+"{truncated_transcript}"
 
 Requirements:
 - Title: 2-5 meaningful words (no filler words like "okay", "um", "so")
 - Summary: 2-3 complete, informative sentences
 
 Output format:
-{{"title": "Your Title Here", "summary": "Your summary here."}}
+{{"title": "Your Title Here", "summary": "Your summary here."}}"""
 
-Remember to output ONLY valid JSON. [/INST]'''
-
-            logger.info("\nPrompt length: %d", len(prompt))
-            
-            # Try different temperatures if generation fails
-            temperatures = [0.7, 0.9, 0.5]
-            success = False
-            
-            for i, temp in enumerate(temperatures, 1):
+                # Use non-async OpenAI client since llama.cpp doesn't support async
                 try:
-                    logger.info("\nAttempt %d with temperature %s", i, temp)
                     response = self.openai_client.chat.completions.create(
-                        model="mistral",
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=temp,
+                        model="mistral",  # Model name doesn't matter for llama.cpp
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt}
+                        ],
+                        temperature=0.7,
                         max_tokens=200
                     )
                     
                     if response and response.choices:
+                        # Parse the JSON response
+                        response_text = response.choices[0].message.content.strip()
                         try:
-                            # Parse the JSON response
-                            response_json = json.loads(response.choices[0].message.content.strip())
+                            response_json = json.loads(response_text)
                             title = response_json.get("title", "Untitled Recording")
                             summary = response_json.get("summary", "No summary available.")
-                            success = True
-                            break
                         except json.JSONDecodeError as e:
-                            logger.error("\nError parsing JSON response: %s", str(e))
-                            continue
+                            logger.error(f"Error parsing JSON response: {e}")
+                            logger.error(f"Raw response: {response_text}")
+                            raise
+                    else:
+                        raise Exception("No response from LLM")
+                        
                 except Exception as e:
-                    logger.error("\nError in attempt %d: %s", i, str(e))
-                    logger.error("Error type: %s", type(e))
-                    logger.error("Traceback:", exc_info=True)
-                    continue
-            
-            if not success:
-                logger.info("All attempts failed, using fallback")
-                # Extract meaningful words for title
-                words = transcript.split()
-                skip_words = {"okay", "um", "uh", "like", "so", "just", "i", "the", "a", "an", "and", "but", "or", "if", "then"}
-                title_words = []
-                for word in words:
-                    word = word.lower().strip('.,!?')
-                    if len(word) > 2 and word not in skip_words and len(title_words) < 5:
-                        title_words.append(word)
-                    if len(title_words) == 5:
-                        break
-                
-                # Ensure we have at least 2 words
-                if len(title_words) < 2:
-                    title_words.extend(['audio', 'recording'][:2 - len(title_words)])
-                
-                title = " ".join(word.capitalize() for word in title_words)
-                
-                # Create a meaningful summary from transcript content
-                first_sentence = f"Discussion about {' '.join(title_words)}."
-                second_sentence = "The conversation explores system functionality and performance."
-                summary = f"{first_sentence} {second_sentence}"
+                    logger.error(f"Error generating title/summary: {e}")
+                    # Use fallback title/summary
+                    words = transcript.split()
+                    skip_words = {"okay", "um", "uh", "like", "so", "just", "i", "the", "a", "an", "and", "but", "or", "if", "then"}
+                    title_words = []
+                    for word in words:
+                        word = word.lower().strip('.,!?')
+                        if len(word) > 2 and word not in skip_words and len(title_words) < 5:
+                            title_words.append(word)
+                        if len(title_words) == 5:
+                            break
+                    
+                    # Ensure we have at least 2 words
+                    if len(title_words) < 2:
+                        title_words.extend(['audio', 'recording'][:2 - len(title_words)])
+                    
+                    title = " ".join(word.capitalize() for word in title_words)
+                    
+                    # Create a meaningful summary from transcript content
+                    first_sentence = f"Discussion about {' '.join(title_words)}."
+                    second_sentence = "The conversation explores various topics and ideas."
+                    summary = f"{first_sentence} {second_sentence}"
             
             # Get current date/time information
             now = datetime.now()
@@ -354,7 +351,8 @@ Remember to output ONLY valid JSON. [/INST]'''
             
             # Save audio file
             logger.info(f"Saving recording to {dir_name}...")
-            wavfile.write(f"{dir_name}/audio.wav", self.sample_rate, audio_array.astype(np.float32))
+            import scipy.io.wavfile as wavfile
+            wavfile.write(f"{dir_name}/audio.wav", self.target_sample_rate, audio_array.astype(np.float32))
             
             # Save transcript
             with open(f"{dir_name}/transcript.txt", 'w') as f:
@@ -367,54 +365,165 @@ Remember to output ONLY valid JSON. [/INST]'''
             logger.info(f"Processing complete. Files saved to: {dir_name}")
         except Exception as e:
             logger.error(f"Error processing recording: {str(e)}")
-            import traceback
             logger.error(traceback.format_exc())
-    
-    def shutdown(self):
-        """Clean shutdown of the audio processor"""
-        logger.info("\nShutting down audio processor...")
-        
-        # Stop the main loop
-        self.shutdown_flag.set()
-        
-        # Wait for processing queue to finish
-        logger.info("Waiting for processing queue to finish...")
-        self.processing_queue.join()
-        
-        # Wait for model initialization thread if still running
-        if self.init_thread.is_alive():
-            logger.info("Waiting for model initialization to finish...")
-            self.init_thread.join()
-        
-        logger.info("Shutdown complete")
-    
-    def start(self):
-        """Start audio monitoring"""
+
+    async def _process_queue(self):
+        """Process recordings in the queue"""
+        logger.info("Starting queue processor...")
+        while self.queue_processor_running:
+            try:
+                # Get recording from queue with timeout
+                try:
+                    audio_array = await asyncio.wait_for(self.processing_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                
+                # Process recording
+                try:
+                    await self._process_recording(audio_array)
+                except Exception as e:
+                    logger.error(f"Error processing recording: {str(e)}")
+                finally:
+                    # Mark task as done
+                    self.processing_queue.task_done()
+                    
+            except Exception as e:
+                logger.error(f"Error in queue processor: {str(e)}")
+                continue
+
+    async def _add_to_queue(self, audio_array):
+        """Add recording to processing queue"""
         try:
-            logger.info("\nStarting audio monitoring...")
-            # Use a larger block size than VAD frame size to reduce CPU usage
-            block_samples = self.vad_frame_samples * 4  # Process 4 VAD frames at a time
-            with sd.InputStream(callback=self.audio_callback,
-                              channels=1,
-                              samplerate=self.sample_rate,
-                              blocksize=block_samples):
-                logger.info("\nListening for speech... Press Ctrl+C to stop.")
-                while not self.shutdown_flag.is_set():
-                    time.sleep(0.1)
-        except KeyboardInterrupt:
-            logger.info("\nStopping audio monitoring...")
+            if self.processing_queue.qsize() >= self.max_queue_size:
+                logger.warning("Queue full, dropping recording")
+                return
+                
+            await self.processing_queue.put(audio_array)
+            logger.info(f"Added recording to queue. Queue size: {self.processing_queue.qsize()}")
         except Exception as e:
-            logger.error(f"Error: {str(e)}")
+            logger.error(f"Error adding to queue: {str(e)}")
+
+    async def run(self):
+        """Main processing loop"""
+        try:
+            logger.info("Starting audio processing...")
+            
+            # Start queue processor task
+            self.queue_processor_running = True
+            self.queue_processor_task = asyncio.create_task(self._process_queue())
+            
+            # Connect to audio server
+            logger.info(f"Connecting to {self.server_host}:{self.server_port}...")
+            self.sock.connect((self.server_host, self.server_port))
+            logger.info("Connected to audio server")
+            
+            # Start audio monitoring if enabled
+            if self.enable_monitoring:
+                logger.info("Audio monitoring enabled - you should hear the incoming audio")
+                # Setup input stream for recording
+                self.audio_input_stream = sd.InputStream(
+                    channels=1,
+                    samplerate=self.target_sample_rate,
+                    blocksize=1024,
+                    dtype=np.float32
+                )
+                self.audio_input_stream.start()
+                self.audio_output_stream.start()
+            
+            while True:
+                try:
+                    data = self.sock.recv(4096)
+                    if not data:
+                        break
+                    
+                    # Convert bytes to float32 array
+                    audio_chunk = np.frombuffer(data, dtype=np.float32)
+                    await self.process_audio_chunk(audio_chunk)
+                    
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    logger.error(f"Error processing chunk: {e}")
+                    continue
+                    
+        except KeyboardInterrupt:
+            logger.info("Stopping audio monitoring...")
+        except Exception as e:
+            logger.error(f"Error in main loop: {e}")
         finally:
-            self.shutdown()
+            await self.cleanup()
+            
+    async def cleanup(self):
+        """Clean up resources"""
+        logger.info("Cleaning up resources...")
+        
+        # Stop queue processor
+        logger.info("Stopping queue processor...")
+        self.queue_processor_running = False
+        if self.queue_processor_task:
+            try:
+                await asyncio.wait_for(self.queue_processor_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("Queue processor task did not finish in time")
+            except Exception as e:
+                logger.error(f"Error stopping queue processor: {e}")
+        
+        # Stop audio monitoring
+        if self.enable_monitoring:
+            if hasattr(self, 'audio_input_stream'):
+                try:
+                    self.audio_input_stream.stop()
+                    self.audio_input_stream.close()
+                except Exception as e:
+                    logger.error(f"Error closing input stream: {e}")
+            if hasattr(self, 'audio_output_stream'):
+                try:
+                    self.audio_output_stream.stop()
+                    self.audio_output_stream.close()
+                except Exception as e:
+                    logger.error(f"Error closing output stream: {e}")
+        
+        # Close socket
+        try:
+            self.sock.close()
+        except Exception as e:
+            logger.error(f"Error closing socket: {e}")
+        
+        # Close OpenAI client
+        if self.openai_client is not None:
+            try:
+                self.openai_client.close()
+            except Exception as e:
+                logger.error(f"Error closing OpenAI client: {e}")
+        
+        # Wait for processing queue to finish with timeout
+        try:
+            logger.info("Waiting for processing queue to finish (max 10s)...")
+            await asyncio.wait_for(self.processing_queue.join(), timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.warning("Timed out waiting for processing queue")
+        except Exception as e:
+            logger.error(f"Error waiting for processing queue: {e}")
+        
+        logger.info("Cleanup complete")
+
+    def _audio_callback(self, indata, frames, time, status):
+        """Audio callback for monitoring"""
+        if status:
+            logger.error(f"Audio callback error: {status}")
+        if self.enable_monitoring:
+            try:
+                gain = 1.5  # Reduced gain to prevent distortion
+                samples_to_play = indata * gain
+                # Clip to prevent distortion
+                samples_to_play = np.clip(samples_to_play, -1.0, 1.0)
+                self.audio_output_stream.write(samples_to_play)
+            except Exception as e:
+                logger.error(f"Error playing audio: {e}")
 
 if __name__ == "__main__":
-    # Create recordings directory if it doesn't exist
-    os.makedirs("recordings", exist_ok=True)
-    
-    # Start the audio processor
     processor = AudioProcessor()
     try:
-        processor.start()
+        asyncio.run(processor.run())
     except KeyboardInterrupt:
-        processor.shutdown()
+        pass

@@ -32,6 +32,10 @@ logging.basicConfig(
 
 logger = logging.getLogger('llm-server')
 
+# Create models directory if it doesn't exist
+models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+os.makedirs(models_dir, exist_ok=True)
+
 # Initialize FastAPI app
 app = FastAPI(title="Local LLM Server")
 
@@ -47,7 +51,7 @@ app.add_middleware(
 # Initialize LLM Engine
 engine_args = AsyncEngineArgs(
     model="TheBloke/Mistral-7B-Instruct-v0.2-GPTQ",  # Pre-quantized model
-    download_dir="models",
+    download_dir=models_dir,  # Use absolute path to models directory
     gpu_memory_utilization=0.7,  # Reduced to avoid OOM
     tensor_parallel_size=1,
     dtype="float16",

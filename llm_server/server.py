@@ -11,6 +11,10 @@ import logging.handlers
 import os
 from datetime import datetime
 
+# Set PyTorch memory management settings
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
 # Set up logging
 os.makedirs('logs', exist_ok=True)
 logging.basicConfig(
@@ -44,12 +48,16 @@ app.add_middleware(
 engine_args = AsyncEngineArgs(
     model="mistralai/Mistral-7B-Instruct-v0.3",
     download_dir="models",
-    gpu_memory_utilization=0.9,  # Adjust based on your GPU
-    tensor_parallel_size=1,  # Use 1 for single GPU
-    dtype="float16",  # Use float16 for GTX 1080 Ti
+    gpu_memory_utilization=0.7,  # Reduced to avoid OOM
+    tensor_parallel_size=1,
+    dtype="float16",
     trust_remote_code=True,
-    max_model_len=8192,  # Adjust based on available GPU memory
-    enforce_eager=True  # More stable on older GPUs
+    max_model_len=4096,  # Reduced context window
+    enforce_eager=True,
+    max_num_batched_tokens=4096,  # Limit batch size
+    max_num_seqs=1,  # Process one sequence at a time
+    quantization="awq",  # Enable quantization
+    gpu_memory_utilization_ratio=0.7  # Explicit memory ratio
 )
 engine = None
 

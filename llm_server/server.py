@@ -121,13 +121,16 @@ async def startup_event():
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: GenerateRequest):
     try:
-        logger.info(f"Received chat completion request: {request.prompt[:100]}...")
+        logger.info("Starting request processing")
+        logger.info(f"Received prompt: {request.prompt[:100]}...")
         
         # Format prompt for chat
         prompt = f"### Human: {request.prompt}\n### Assistant: "
+        logger.info("Formatted prompt")
         
         # Generate response with error handling
         try:
+            logger.info("Starting generation...")
             response = llm(
                 prompt,
                 max_tokens=min(request.max_tokens, 1024),  # Limit max tokens
@@ -136,30 +139,34 @@ async def create_chat_completion(request: GenerateRequest):
                 stop=request.stop or ["### Human:", "\n### Human:"],
                 echo=False
             )
-            logger.info("Generation completed successfully")
+            logger.info("Generation completed")
+            
+            result = {
+                "id": "chatcmpl-" + os.urandom(12).hex(),
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": "mistral-7b-instruct",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": response["choices"][0]["text"].strip()
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": response["usage"]["prompt_tokens"],
+                    "completion_tokens": response["usage"]["completion_tokens"],
+                    "total_tokens": response["usage"]["total_tokens"]
+                }
+            }
+            logger.info("Response formatted successfully")
+            return result
+            
         except Exception as e:
             logger.error(f"Error during generation: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail="Generation failed")
 
-        return {
-            "id": "chatcmpl-" + os.urandom(12).hex(),
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": "mistral-7b-instruct",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": response["choices"][0]["text"].strip()
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": response["usage"]["prompt_tokens"],
-                "completion_tokens": response["usage"]["completion_tokens"],
-                "total_tokens": response["usage"]["total_tokens"]
-            }
-        }
     except Exception as e:
         logger.error(f"Error handling request: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

@@ -14,14 +14,14 @@ logger = logging.getLogger('audio-processor.orchestrator')
 
 class AudioOrchestrator:
     def __init__(self, server_host: str = 'staple.local', server_port: int = 12345,
-                 enable_monitoring: bool = True):
+                 enable_monitoring: bool = True, recordings_dir: str = 'recordings'):
         # Initialize components
         self.io_handler = AudioIOHandler(server_host, server_port, enable_monitoring)
         self.vad = VoiceActivityDetector()
         self.processor = AudioProcessor()
         self.transcriber = AudioTranscriber()
         self.llm_processor = LLMProcessor()
-        self.storage = StorageManager()
+        self.storage = StorageManager(recordings_dir)
         
         # Processing queue
         self.max_queue_size = 10

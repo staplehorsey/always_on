@@ -37,6 +37,7 @@ recordings/
 logs/
 *.log
 .env
+silero_vad.jit
 
 # System specific
 .DS_Store

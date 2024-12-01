@@ -1,0 +1,28 @@
+[Unit]
+Description=Always On Audio Processing Service
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+EnvironmentFile=/etc/always_on/always_on.conf
+ExecStart=/opt/always_on/venv/bin/python /opt/always_on/audio_processor.py
+WorkingDirectory=/opt/always_on
+Restart=always
+RestartSec=3
+StandardOutput=append:/var/log/always_on/always_on.log
+StandardError=append:/var/log/always_on/always_on.error.log
+
+# Security settings
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+
+[Install]
+WantedBy=multi-user.target

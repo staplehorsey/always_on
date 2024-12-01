@@ -108,8 +108,8 @@ async def startup_event():
         logger.info(f"Model loaded successfully:")
         logger.info(f"- Context window: {llm.n_ctx()}")
         logger.info(f"- Vocabulary size: {llm.n_vocab()}")
-        logger.info(f"- GPU layers: {llm.params.n_gpu_layers}")
-        logger.info(f"- Batch size: {llm.params.n_batch}")
+        logger.info(f"- Model parameters: {llm.model_path}")
+        logger.info(f"- GPU layers loaded: {llm._n_gpu_layers}")
         
         # Force another GC after model load
         gc.collect()

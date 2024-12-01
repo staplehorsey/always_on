@@ -46,6 +46,10 @@ engine_args = AsyncEngineArgs(
     download_dir="models",
     gpu_memory_utilization=0.9,  # Adjust based on your GPU
     tensor_parallel_size=1,  # Use 1 for single GPU
+    dtype="float16",  # Use float16 for GTX 1080 Ti
+    trust_remote_code=True,
+    max_model_len=8192,  # Adjust based on available GPU memory
+    enforce_eager=True  # More stable on older GPUs
 )
 engine = None
 
